@@ -40,6 +40,16 @@ function stop() {
   const platform = os.platform();
   let stoppedService = false;
 
+  // 0. Put any tool we redirected back on its own endpoint BEFORE the port goes
+  //    away. A tool left pointing at a dead localhost port is hard-down — the
+  //    exact failure this program exists to prevent.
+  const reverted = require('./autostart').revertRouting();
+  for (const tool of reverted) {
+    console.log(`✓ Reverted ${tool} routing before stopping (so ${tool} keeps working without Holdfast).`);
+  }
+  if (reverted.includes('kiro')) console.log('  Reload the Kiro window (Developer: Reload Window) to apply.');
+  if (reverted.includes('claude')) console.log('  Start a new Claude Code session to apply.');
+
   // 1. If installed as a managed service, stop it through the manager so it
   //    doesn't immediately respawn.
   if (platform === 'darwin' && macServiceInstalled()) {

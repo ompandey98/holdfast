@@ -12,6 +12,7 @@ const log = require('./log');
 const { forwardWithHold, openWithHold } = require('./holdloop');
 const { targetFor } = require('./probe');
 const stats = require('./stats');
+const kiroFilter = require('./kiroFilter');
 
 function readBody(req) {
   return new Promise((resolve, reject) => {
@@ -51,6 +52,40 @@ function sseError(message) {
   return `event: error\ndata: ${payload}\n\n`;
 }
 
+// Turn a failure into the response the client can actually act on.
+//
+//   • missing/broken AWS credentials -> 403 in the AWS error shape, so Claude
+//     Code prints "could not obtain AWS credentials: <reason>" instead of an
+//     opaque 502 that looks like a Holdfast bug;
+//   • a TLS/cert or protocol error   -> 502 naming the error code (these are
+//     never held, so they surface in seconds, not hours);
+//   • an exhausted hold window       -> its own message, unchanged.
+function describeFailure(err) {
+  if (err && err.isCredentialError) {
+    const message = `Holdfast: could not obtain AWS credentials: ${err.message}`;
+    return {
+      status: 403,
+      headers: { 'content-type': 'application/json', 'x-amzn-errortype': 'HoldfastCredentialError' },
+      body: JSON.stringify({ message }),
+      message,
+    };
+  }
+  const message = err && err.isHoldTimeout
+    ? err.message
+    : err && err.isFastFail
+      ? `Holdfast: upstream failed fast (${err.code}): ${err.message}`
+      : `Holdfast internal error: ${err && err.message}`;
+  return {
+    status: 502,
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      type: 'error',
+      error: { type: 'holdfast_error', code: (err && err.code) || null, message },
+    }),
+    message,
+  };
+}
+
 function makeHandler(listener) {
   const label = listener.name;
 
@@ -63,6 +98,22 @@ function makeHandler(listener) {
     if (req.url === '/__holdfast/stats') {
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify(stats.snapshot()));
+      return;
+    }
+
+    // The Kiro listener answers non-KRS traffic locally instead of forwarding a
+    // stranger's request to Kiro's backend (a dev server sharing the port was
+    // seen having its .mp4 GETs proxied to kiro.dev).
+    if (listener.kiro && config.kiroFilter && !kiroFilter.isKrsRequest(req.method, req.url)) {
+      if (kiroFilter.shouldLog(`${label}:notkiro`)) {
+        log.warn(
+          `[${label}] ignoring non-Kiro request ${req.method} ${req.url} on :${listener.port} ` +
+            `— something else on this machine is using the port. Move Holdfast with HOLDFAST_KIRO_PORT, ` +
+            `or allow it with HOLDFAST_KIRO_ALLOW_PATHS. (further such logs suppressed for 60s)`
+        );
+      }
+      res.writeHead(404, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ holdfast: 'not a Kiro request' }));
       return;
     }
 
@@ -143,14 +194,14 @@ function makeHandler(listener) {
       }
     } catch (err) {
       stopHeartbeat();
-      log.error(`[${label}] request failed: ${err.message}`);
-      const msg = err.isHoldTimeout ? err.message : `Holdfast internal error: ${err.message}`;
+      const failure = describeFailure(err);
+      log.error(`[${label}] [${agent}] request failed (${failure.status}): ${failure.message}`);
       if (headersSent) {
-        res.write(sseError(msg));
+        res.write(sseError(failure.message));
         res.end();
       } else {
-        if (!res.headersSent) res.writeHead(502, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ type: 'error', error: { type: 'holdfast_error', message: msg } }));
+        if (!res.headersSent) res.writeHead(failure.status, failure.headers);
+        res.end(failure.body);
       }
     }
 

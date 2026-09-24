@@ -1,14 +1,15 @@
 {
   "name": "holdfast",
-  "version": "1.0.0",
-  "description": "Hold your Claude Code session fast through any network drop. A zero-dependency local proxy that holds in-flight requests during VPN/wifi blips and replays them the instant the network returns.",
+  "version": "1.1.0",
+  "description": "Hold your AI-coding session fast through any network drop. A zero-dependency local proxy that holds in-flight requests during VPN/wifi blips and replays them the instant the network returns — with managed, revertible routing for Claude Code (incl. Bedrock) and Kiro.",
   "type": "commonjs",
   "bin": {
     "holdfast": "bin/holdfast"
   },
   "main": "src/server.js",
   "scripts": {
-    "start": "node bin/holdfast start"
+    "start": "node bin/holdfast start",
+    "test": "node test/integration.js && node test/streaming.js && node test/routing.js && node test/bedrock.js"
   },
   "engines": {
     "node": ">=16"
@@ -16,6 +17,8 @@
   "keywords": [
     "claude",
     "claude-code",
+    "kiro",
+    "bedrock",
     "proxy",
     "resilient",
     "network",

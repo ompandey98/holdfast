@@ -26,32 +26,51 @@ function help() {
 Holdfast — keep your AI coding session alive through any network drop.
 
 USAGE
-  holdfast start [--minutes 60] [--port 8787] [--interval 30]
+  holdfast start [--minutes 180] [--port 8787] [--interval 30]
                         Start the resilient proxy (default command)
-  holdfast status       Check whether Holdfast is running (all listeners)
-  holdfast stop         Stop any running Holdfast (frees the port; stops the service too)
-  holdfast stats        Show lifetime counters: drops caught, sessions saved, per tool/provider
-  holdfast install      Auto-start Holdfast on login (macOS launchd / Linux systemd)
-  holdfast uninstall    Remove the auto-start entry
+  holdfast install [--minutes 180]
+                        Copy Holdfast to a stable path and auto-start it on login
+                        (macOS launchd / Linux systemd). Options are baked in.
+  holdfast uninstall    Remove auto-start (reverts tool routing first)
+  holdfast status       Check every listener, and whether it is supervised
+  holdfast stop         Stop Holdfast (reverts tool routing first, then frees ports)
+  holdfast stats        Lifetime counters: drops caught, sessions saved, per tool/provider
+  holdfast doctor       Diagnose whether your tools are ACTUALLY protected
+  holdfast claude enable|disable|status
+                        Route Claude Code through Holdfast, safely (see below)
+  holdfast kiro enable|disable|status
+                        Route Kiro chat through Holdfast, safely (see below)
   holdfast help         Show this help
 
-POINT YOUR IDE AT IT (base URL / API endpoint override):
-  Claude Code (Anthropic API):
-      export ANTHROPIC_BASE_URL=http://localhost:8787
-  Claude Code in Bedrock mode (Holdfast re-signs with your AWS creds):
-      export ANTHROPIC_BEDROCK_BASE_URL=http://localhost:8789
-      export CLAUDE_CODE_SKIP_BEDROCK_AUTH=1
-  Codex/OpenAI: set the OpenAI base URL to http://localhost:8788  (see README)
-  Kiro (Kiro Runtime Service, bearer token): set codewhisperer.config.krsEndpoints
-      in Kiro settings to http://localhost:8790  (see README)
+ROUTING YOUR TOOLS (the part that actually protects anything)
+  Prefer the managed commands — they refuse to point a tool at Holdfast unless
+  Holdfast is installed as a service and the port answers as ours, they back up
+  every file they touch, and they revert cleanly:
 
-All four listeners (Anthropic, OpenAI, Bedrock, Kiro) start by default — nothing
-to enable. Just run "holdfast start" and point each tool at its port.
+      holdfast install && holdfast claude enable && holdfast kiro enable
+
+  claude enable writes into ~/.claude/settings.json (env block), which is where
+  Claude Code reads it even when a wrapper launches it — an exported shell
+  variable never reaches a wrapper-launched Claude Code. In Bedrock mode it
+  points at a region-tagged URL so the proxy signs for YOUR region:
+      ANTHROPIC_BEDROCK_BASE_URL=http://127.0.0.1:8789/region/<your region>
+      CLAUDE_CODE_SKIP_BEDROCK_AUTH=1
+  kiro enable writes codewhisperer.config.krsEndpoints in Kiro's user settings,
+  for the region in Kiro's profile ARN, then asks you to reload the Kiro window.
+
+  Manual alternative (Anthropic API users): export ANTHROPIC_BASE_URL=http://localhost:8787
+  Codex/OpenAI: set the OpenAI base URL to http://localhost:8788  (see README)
+
+  WARNING: pointing a tool at Holdfast WITHOUT installing it means that tool is
+  hard-down whenever Holdfast is not running (e.g. you closed the terminal).
 
 CONFIG (env vars, all optional)
-  HOLDFAST_HOLD_MINUTES   how long to keep holding   (default 60)
+  HOLDFAST_HOLD_MINUTES   how long to keep holding   (default 180 = 3 hours)
   HOLDFAST_RETRY_INTERVAL_MS  probe interval ms       (default 30000)
   HOLDFAST_HEARTBEAT_MS   keep-alive ping interval    (default 15000)
+  HOLDFAST_BEDROCK_REGION / HOLDFAST_KIRO_REGION      region per listener
+  HOLDFAST_AWS_CREDENTIAL_COMMAND  command printing AWS credential JSON
+  HOLDFAST_AWS_PROFILE    profile for credential_process / static keys
   HOLDFAST_LISTENERS      JSON array of {name,port,upstream} for multi-provider
   HOLDFAST_LOG_FILE       log path                    (default ~/.holdfast/holdfast.log)
 
@@ -59,10 +78,34 @@ Current: hold ~${config.holdMinutes} min, ${config.listeners.length} listener(s)
 `);
 }
 
+// Is Holdfast supervised, and from where? A tool routed through an
+// unsupervised Holdfast breaks the moment that terminal closes, so this is
+// reported with the listeners rather than hidden behind `doctor`.
+function reportSupervision() {
+  const fs = require('fs');
+  const st = require('../src/route').installState();
+  if (!st) {
+    console.log('• not installed as a service — Holdfast stops when this process does.');
+    console.log('  Install (recommended before routing any tool): holdfast install');
+    return;
+  }
+  const exists = fs.existsSync(st.appDir);
+  console.log(
+    `• supervised by ${st.manager} from ${st.appDir}${exists ? '' : '  ⚠ MISSING — run: holdfast install'}` +
+      `  (v${st.version}, hold ${st.env && st.env.HOLDFAST_HOLD_MINUTES} min)`
+  );
+  for (const [tool, mod] of [['claude', '../src/claudeRoute'], ['kiro', '../src/kiroRoute']]) {
+    try {
+      if (require(mod).isEnabled()) console.log(`• ${tool} is routed through Holdfast (revert: holdfast ${tool} disable)`);
+    } catch (_) {}
+  }
+}
+
 function status() {
   let pending = config.listeners.length;
   let anyDown = false;
   if (!pending) { console.log('no listeners configured'); return; }
+  reportSupervision();
 
   const settle = (ok) => {
     if (!ok) anyDown = true;
@@ -74,7 +117,7 @@ function status() {
     const finishOnce = (fn) => { if (done) return; done = true; fn(); };
 
     const req = http.get(
-      { host: '127.0.0.1', port: l.port, path: '/__holdfast/health', timeout: 3000 },
+      { host: '127.0.0.1', port: l.port, path: '/__holdfast/health', timeout: 3000, agent: false },
       (res) => {
         const chunks = [];
         res.on('data', (c) => chunks.push(c));
@@ -141,6 +184,26 @@ switch (cmd) {
   case 'uninstall':
     require('../src/autostart').uninstall();
     break;
+  case 'doctor':
+    require('../src/doctor').run().then((code) => process.exit(code));
+    break;
+  case 'kiro':
+  case 'claude': {
+    const mod = require(cmd === 'kiro' ? '../src/kiroRoute' : '../src/claudeRoute');
+    const sub = argv[1] && !argv[1].startsWith('-') ? argv[1] : 'status';
+    const force = argv.includes('--force');
+    if (sub === 'enable') {
+      Promise.resolve(mod.enable({ force })).then((code) => process.exit(code || 0));
+    } else if (sub === 'disable') {
+      process.exit(mod.disable() || 0);
+    } else if (sub === 'status') {
+      Promise.resolve(mod.status()).then(() => process.exit(0));
+    } else {
+      console.error(`Unknown "${cmd}" subcommand: ${sub}. Use enable | disable | status.`);
+      process.exit(1);
+    }
+    break;
+  }
   case 'help':
   case '-h':
   case '--help':

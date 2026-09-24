@@ -9,9 +9,6 @@
 // from disk each time so refreshes (ada, SSO) are picked up automatically.
 
 const crypto = require('crypto');
-const fs = require('fs');
-const os = require('os');
-const path = require('path');
 
 function sha256hex(data) {
   return crypto.createHash('sha256').update(data).digest('hex');
@@ -29,78 +26,48 @@ function uriEncode(str) {
   );
 }
 
-// Minimal INI parser, enough for ~/.aws/credentials.
-function parseIni(text) {
-  const out = {};
-  let section = null;
-  for (const rawLine of text.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line || line.startsWith('#') || line.startsWith(';')) continue;
-    const sec = line.match(/^\[\s*(.+?)\s*\]$/);
-    if (sec) {
-      section = sec[1].replace(/^profile\s+/, '');
-      out[section] = out[section] || {};
-      continue;
-    }
-    const kv = line.match(/^([^=]+?)\s*=\s*(.*)$/);
-    if (kv && section) out[section][kv[1].trim().toLowerCase()] = kv[2].trim();
-  }
-  return out;
-}
-
-// Resolve credentials: env vars first, then the shared credentials file.
+// Credential resolution lives in credentials.js (full chain: explicit command,
+// Claude Code's awsCredentialExport, environment, credential_process, static
+// keys — cached until shortly before expiry). Kept exported under the old name
+// for compatibility; returns null instead of throwing, as it always did.
 function loadCredentials() {
-  if (process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY) {
-    return {
-      accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-      secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
-      sessionToken: process.env.AWS_SESSION_TOKEN || null,
-      source: 'environment',
-    };
-  }
-  const file =
-    process.env.AWS_SHARED_CREDENTIALS_FILE ||
-    path.join(os.homedir(), '.aws', 'credentials');
-  const profile =
-    process.env.HOLDFAST_AWS_PROFILE || process.env.AWS_PROFILE || 'default';
   try {
-    const ini = parseIni(fs.readFileSync(file, 'utf8'));
-    const p = ini[profile];
-    if (p && p.aws_access_key_id && p.aws_secret_access_key) {
-      return {
-        accessKeyId: p.aws_access_key_id,
-        secretAccessKey: p.aws_secret_access_key,
-        sessionToken: p.aws_session_token || p.aws_security_token || null,
-        source: `${file} [${profile}]`,
-      };
-    }
-  } catch (_) {}
-  return null;
+    return require('./credentials').resolve();
+  } catch (_) {
+    return null;
+  }
 }
 
 // bedrock-runtime.us-east-1.amazonaws.com -> service 'bedrock', region 'us-east-1'.
 // The BedrockRuntime API signs under the service name 'bedrock'.
+//
+// `looksAws` matters: a custom upstream (a VPC endpoint, a corporate proxy, a
+// test double) tells us nothing about the service or region, and guessing from
+// its hostname produced nonsense scopes like ".../us-west-2/127/aws4_request".
+// In that case the caller's explicit service/region win.
 function serviceAndRegion(host) {
-  const labels = String(host).split(':')[0].split('.');
-  let service = labels[0] || '';
+  const bare = String(host).split(':')[0];
+  const labels = bare.split('.');
+  const looksAws = /\.amazonaws\.com(\.cn)?$/.test(bare) && labels.length >= 4;
+  let service = looksAws ? labels[0] : null;
   if (service === 'bedrock-runtime') service = 'bedrock';
-  const region = labels.length >= 4 ? labels[1] : 'us-east-1';
-  return { service, region };
+  return { service, region: looksAws ? labels[1] : null, looksAws };
 }
 
 // Sign and return the outbound headers: original headers minus the client's
 // stale auth, plus fresh x-amz-date / x-amz-content-sha256 / authorization.
 // `path` must be the exact wire path that will be sent upstream.
-function signedHeaders({ method, path: reqPath, headers, body, host }) {
-  const creds = loadCredentials();
-  if (!creds) {
-    const e = new Error(
-      'no AWS credentials found to sign the request (checked env vars and ~/.aws/credentials) — refresh your credentials (e.g. ada) and retry'
-    );
-    e.code = 'NO_AWS_CREDENTIALS';
-    throw e;
-  }
-  const { service, region } = serviceAndRegion(host);
+function signedHeaders({ method, path: reqPath, headers, body, host, region: regionOverride, service: serviceOverride }) {
+  // Full credential chain, cached and auto-refreshed near expiry. Throws a
+  // CredentialError, which the server renders as a readable AWS-shaped 403
+  // instead of a bare 502 — and which is never held (it is not a network fault).
+  const creds = require('./credentials').resolve();
+  const derived = serviceAndRegion(host);
+  // An explicit region (from a /region/<r> prefix or the listener config) wins
+  // over the one inferred from the host, so a signature is never scoped to the
+  // wrong region. Same for the service, which a non-AWS upstream cannot imply.
+  const service = derived.service || serviceOverride || 'bedrock';
+  const region = regionOverride || derived.region || 'us-east-1';
 
   const amzDate = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d{3}/, ''); // YYYYMMDDTHHMMSSZ
   const dateStamp = amzDate.slice(0, 8);

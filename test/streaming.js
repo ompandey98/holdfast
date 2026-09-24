@@ -32,10 +32,10 @@ function collect(res, onChunk) {
   });
 }
 
-function post(port, headers, body) {
+function post(port, headers, body, p = '/v1/messages') {
   return new Promise((resolve, reject) => {
     const req = http.request(
-      { host: '127.0.0.1', port, path: '/v1/messages', method: 'POST', headers },
+      { host: '127.0.0.1', port, path: p, method: 'POST', headers, agent: false },
       (res) => resolve(res)
     );
     req.on('error', reject);
@@ -139,7 +139,10 @@ async function testKiroListener() {
   assert(names === 'anthropic,bedrock,kiro,openai', `default listeners should be all four, got: ${names}`);
   const started = Date.now();
   const times = [];
-  const res = await post(9182, { accept: 'application/vnd.amazon.eventstream', authorization: 'Bearer KIROTOKEN' }, '{}');
+  // A real KRS wire path: the kiro listener answers anything that is not
+  // KRS-shaped locally (see the port guard in server.js / kiroFilter.js), which
+  // is what stops a neighbouring dev server's traffic reaching kiro.dev.
+  const res = await post(9182, { accept: 'application/vnd.amazon.eventstream', authorization: 'Bearer KIROTOKEN' }, '{}', '/generateAssistantResponse');
   await collect(res, (_c, t) => times.push(t - started));
   up.close(); server.forEach((s) => s.close());
   delete process.env.HOLDFAST_PORT;
@@ -194,6 +197,63 @@ async function testPortConflictIsolation() {
   console.log('✅ E: a busy port is skipped; other listeners keep working (never fails the system)');
 }
 
+// F) The Kiro path end to end: a drop BEFORE the first response byte on an AWS
+//    eventstream (binary) response is held and replayed, and the client receives
+//    the complete, byte-identical binary stream. Binary framing is the risk here
+//    — a stray keep-alive byte or a truncated replay would corrupt Kiro's chat —
+//    so this asserts the exact bytes, not just "something arrived".
+async function testKiroEventstreamHoldReplay() {
+  delete process.env.HOLDFAST_LISTENERS;
+  process.env.HOLDFAST_KIRO_PORT = '9172';
+  process.env.HOLDFAST_KIRO_UPSTREAM = 'http://127.0.0.1:9173';
+  process.env.HOLDFAST_PORT = '9171';
+  process.env.HOLDFAST_OPENAI_PORT = '9170';
+  process.env.HOLDFAST_BEDROCK_PORT = '9169';
+  process.env.HOLDFAST_RETRY_INTERVAL_MS = '300';
+  process.env.HOLDFAST_HOLD_MINUTES = '1';
+
+  // Bytes an SSE parser would mangle and a text round-trip would corrupt.
+  const frame = Buffer.from([0x00, 0x00, 0x01, 0x2f, 0x0a, 0x3a, 0x20, 0xff, 0xfe, 0x7b, 0x22, 0x61, 0x22, 0x7d, 0x00]);
+  const expected = Buffer.concat([frame, frame, frame]);
+
+  const server = freshServer();
+  let up = null;
+  // The upstream is DOWN when the request arrives, and comes back mid-hold.
+  setTimeout(() => {
+    up = once(9173, (req, res) => {
+      res.writeHead(200, { 'content-type': 'application/vnd.amazon.eventstream' });
+      let i = 0;
+      const t = setInterval(() => {
+        i++;
+        res.write(frame);
+        if (i >= 3) { clearInterval(t); res.end(); }
+      }, 150);
+    });
+  }, 700);
+
+  const res = await post(9172, { accept: 'application/vnd.amazon.eventstream', authorization: 'Bearer KIROTOKEN', 'content-type': 'application/json' }, '{}', '/generateAssistantResponse');
+  assert.strictEqual(res.statusCode, 200, `the replayed response must carry the real status, got ${res.statusCode}`);
+  assert.strictEqual(
+    String(res.headers['content-type']),
+    'application/vnd.amazon.eventstream',
+    'the binary content type must be relayed unchanged'
+  );
+  const body = await collect(res);
+  if (up) up.close();
+  server.forEach((s) => s.close());
+  delete process.env.HOLDFAST_KIRO_PORT;
+  delete process.env.HOLDFAST_KIRO_UPSTREAM;
+  delete process.env.HOLDFAST_PORT;
+  delete process.env.HOLDFAST_OPENAI_PORT;
+  delete process.env.HOLDFAST_BEDROCK_PORT;
+  delete process.env.HOLDFAST_RETRY_INTERVAL_MS;
+  delete process.env.HOLDFAST_HOLD_MINUTES;
+
+  assert.strictEqual(body.length, expected.length, `the client must receive every byte (${body.length} of ${expected.length})`);
+  assert(body.equals(expected), 'the replayed binary stream must be byte-identical — no injected keep-alive bytes, no truncation');
+  console.log(`✅ F: Kiro eventstream drop held and replayed; ${body.length} bytes delivered byte-identical`);
+}
+
 // Load a fresh server module with current env (config is read at require time).
 function freshServer() {
   for (const k of Object.keys(require.cache)) {
@@ -209,6 +269,7 @@ function freshServer() {
     await testEventstreamAndBearer();
     await testKiroListener();
     await testPortConflictIsolation();
+    await testKiroEventstreamHoldReplay();
     console.log('\n=== STREAMING TESTS PASSED ===');
     process.exit(0);
   } catch (err) {

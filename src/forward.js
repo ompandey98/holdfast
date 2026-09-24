@@ -32,7 +32,10 @@ const config = require('./config');
 const NETWORK_ERROR_CODES = new Set([
   'ECONNRESET', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'ETIMEDOUT',
   'EPIPE', 'ECONNABORTED', 'EHOSTUNREACH', 'ENETUNREACH', 'ENETDOWN',
-  'EHOSTDOWN',
+  'EHOSTDOWN', 'ESOCKETTIMEDOUT', 'EADDRNOTAVAIL',
+  // undici / fetch-style connect and socket failures.
+  'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_SOCKET', 'UND_ERR_HEADERS_TIMEOUT',
+  'UND_ERR_BODY_TIMEOUT',
 ]);
 
 class NetworkError extends Error {
@@ -44,16 +47,69 @@ class NetworkError extends Error {
   }
 }
 
-function isNetworkErrorCode(code) {
-  return NETWORK_ERROR_CODES.has(code);
+// Anything that is NOT a dropped line: a TLS/certificate rejection, a protocol
+// error, a bug. Holding these was the bug — a cert failure used to be retried
+// silently for the entire hold window (hours) instead of being reported in
+// seconds. They fail fast, with the code, so the cause is visible.
+class FastFailError extends Error {
+  constructor(message, code) {
+    super(message);
+    this.name = 'FastFailError';
+    this.code = code;
+    this.isFastFail = true;
+  }
 }
 
-function toNetworkError(err) {
-  if (err && err.isNetworkError) return err;
-  if (err && isNetworkErrorCode(err.code)) return new NetworkError(err.message, err.code);
-  // Unknown error shape — treat conservatively as network so we hold rather
-  // than kill the session.
-  return new NetworkError((err && err.message) || 'unknown error', (err && err.code) || 'EUNKNOWN');
+function isNetworkErrorCode(code) {
+  if (NETWORK_ERROR_CODES.has(code)) return true;
+  // undici wraps connect failures; treat any *_CONNECT_* socket code as network.
+  return typeof code === 'string' && /^UND_ERR_(CONNECT|SOCKET)/.test(code);
+}
+
+// TLS/certificate problems are configuration or interception issues, never a
+// blip. Node reports them with these shapes.
+function isTlsErrorCode(code) {
+  return (
+    typeof code === 'string' &&
+    (code.startsWith('ERR_TLS_') ||
+      code.startsWith('CERT_') ||
+      code === 'UNABLE_TO_VERIFY_LEAF_SIGNATURE' ||
+      code === 'SELF_SIGNED_CERT_IN_CHAIN' ||
+      code === 'DEPTH_ZERO_SELF_SIGNED_CERT' ||
+      code === 'EPROTO')
+  );
+}
+
+// Classify a raw error into "hold it" (NetworkError) or "report it now"
+// (FastFailError). Credential errors pass through untouched: they are neither,
+// and the server renders them as a readable AWS-shaped 403.
+function classify(err) {
+  if (err && (err.isNetworkError || err.isFastFail || err.isCredentialError)) return err;
+  const code = (err && err.code) || 'EUNKNOWN';
+  const message = (err && err.message) || 'unknown error';
+  if (isTlsErrorCode(code)) return new FastFailError(`TLS/certificate failure: ${message}`, code);
+  if (isNetworkErrorCode(code)) return new NetworkError(message, code);
+  return new FastFailError(message, code);
+}
+
+// A /region/<r> path prefix lets one Bedrock listener serve whichever region
+// the client is configured for. Anything else is passed through unchanged.
+const REGION_RE = /^[a-z]{2}(-gov)?-[a-z]+-\d$/;
+
+function splitRegionPrefix(reqPath) {
+  const m = /^\/region\/([^/?]+)(\/.*|\?.*)?$/.exec(String(reqPath));
+  if (!m) return { region: null, path: reqPath };
+  if (!REGION_RE.test(m[1])) return { region: null, path: reqPath, invalidRegion: m[1] };
+  return { region: m[1], path: m[2] && m[2] !== '' ? m[2] : '/' };
+}
+
+// Swap the region label of a regional AWS host, so /region/us-west-2 really
+// lands on bedrock-runtime.us-west-2.amazonaws.com. A custom upstream host that
+// doesn't look regional is left alone (only the signing region changes).
+function hostForRegion(host, region) {
+  const m = /^([a-z0-9-]+?)\.[a-z]{2}(?:-gov)?-[a-z]+-\d\.(amazonaws\.com(?:\.cn)?)$/.exec(host);
+  if (!m) return host;
+  return `${m[1]}.${region}.${m[2]}`;
 }
 
 // Build the transport + request options for one attempt against `listener`.
@@ -64,9 +120,29 @@ function buildOptions(listener, { method, path: reqPath, headers, body }) {
   const upstreamUrl = typeof listener === 'string' ? listener : listener.upstream;
   const isAws = typeof listener === 'object' && !!listener.aws;
   const upstream = new URL(upstreamUrl);
+
+  // Optional /region/<r> prefix: strip it before signing and forwarding, and
+  // use <r> as both the destination region and the SigV4 scope region.
+  let clientPath = reqPath;
+  let region = (typeof listener === 'object' && listener.region) || null;
+  if (typeof listener === 'object' && listener.regionPrefix) {
+    const split = splitRegionPrefix(reqPath);
+    if (split.invalidRegion) {
+      throw new FastFailError(
+        `invalid region in path prefix: "${split.invalidRegion}" (expected e.g. /region/us-west-2/...)`,
+        'EBADREGION'
+      );
+    }
+    if (split.region) {
+      region = split.region;
+      clientPath = split.path;
+      upstream.host = hostForRegion(upstream.host, region);
+    }
+  }
+
   const isHttps = upstream.protocol === 'https:';
   const transport = isHttps ? https : http;
-  const wirePath = joinPath(upstream.pathname, reqPath);
+  const wirePath = joinPath(upstream.pathname, clientPath);
 
   let outHeaders;
   if (isAws) {
@@ -76,6 +152,8 @@ function buildOptions(listener, { method, path: reqPath, headers, body }) {
       headers,
       body,
       host: upstream.host,
+      region,
+      service: (typeof listener === 'object' && listener.service) || undefined,
     });
     delete outHeaders.host;
     delete outHeaders.Host;
@@ -118,17 +196,13 @@ function forwardOnce(listener, request) {
       res.on('end', () =>
         resolve({ statusCode: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) })
       );
-      res.on('error', (err) => {
-        if (isNetworkErrorCode(err.code) || !err.code) {
-          reject(new NetworkError(`upstream stream error: ${err.message}`, err.code || 'ESTREAM'));
-        } else reject(err);
-      });
+      res.on('error', (err) => reject(classify(err)));
     });
 
     req.setTimeout(config.upstreamTimeoutMs, () => {
       req.destroy(new NetworkError('upstream timeout', 'ETIMEDOUT'));
     });
-    req.on('error', (err) => reject(toNetworkError(err)));
+    req.on('error', (err) => reject(classify(err)));
 
     if (body && body.length) req.write(body);
     req.end();
@@ -157,7 +231,7 @@ function openUpstream(listener, request) {
       if (!settled) req.destroy(new NetworkError('upstream timeout', 'ETIMEDOUT'));
     });
     req.on('error', (err) => {
-      if (!settled) reject(toNetworkError(err));
+      if (!settled) reject(classify(err));
     });
 
     if (body && body.length) req.write(body);
@@ -172,4 +246,14 @@ function joinPath(basePath, reqPath) {
   return basePath.replace(/\/$/, '') + reqPath;
 }
 
-module.exports = { forwardOnce, openUpstream, NetworkError, isNetworkErrorCode };
+module.exports = {
+  forwardOnce,
+  openUpstream,
+  NetworkError,
+  FastFailError,
+  isNetworkErrorCode,
+  isTlsErrorCode,
+  classify,
+  splitRegionPrefix,
+  hostForRegion,
+};

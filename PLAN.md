@@ -2,6 +2,15 @@
 
 > Hold your Claude Code session fast through any network drop.
 
+> **Status note (v1.1.0):** this is the original design document, kept for the
+> reasoning behind the architecture. Where it differs from what shipped, the
+> README is authoritative. The three material changes since: the hold window
+> defaults to **180 minutes**, not 60; responses **stream through live** instead
+> of the buffer-then-relay MVP in §4 (only a PRE-FIRST-BYTE drop is held and
+> replayed); and there are four listeners plus managed, revertible routing for
+> Claude Code (including Bedrock) and Kiro — see `holdfast claude enable`,
+> `holdfast kiro enable` and `holdfast doctor`.
+
 A tiny local proxy that sits between Claude Code and the Anthropic API. When your
 VPN reconnects, wifi switches, or the internet blips for a few seconds, Holdfast
 **holds the in-flight request**, polls connectivity every 30s for up to an hour,

@@ -4,8 +4,9 @@
 // with an environment variable (or CLI flag, which sets the env var) so no code
 // edits are ever needed.
 
-const os = require('os');
+const fs = require('fs');
 const path = require('path');
+const paths = require('./paths');
 
 function intEnv(name, fallback) {
   const v = parseInt(process.env[name], 10);
@@ -15,11 +16,58 @@ function intEnv(name, fallback) {
 // --- Hold window -----------------------------------------------------------
 // How long to keep holding a request while the network is down. Expressed in
 // friendly minutes; converted to a retry count against the probe interval.
-const holdMinutes = intEnv('HOLDFAST_HOLD_MINUTES', 60);
+// Three hours by default: a hotel/flight/VPN outage that outlasts an hour is
+// exactly the case worth surviving, and holding costs nothing while idle.
+const holdMinutes = intEnv('HOLDFAST_HOLD_MINUTES', 180);
 const retryIntervalMs = intEnv('HOLDFAST_RETRY_INTERVAL_MS', 30_000);
 const maxRetries =
   intEnv('HOLDFAST_MAX_RETRIES', 0) ||
   Math.max(1, Math.ceil((holdMinutes * 60_000) / retryIntervalMs));
+
+// --- Region resolution -----------------------------------------------------
+// The regions KRS actually serves. A region outside this set has no
+// runtime.<region>.kiro.dev host at all, so we never forward to one.
+const KRS_REGIONS = new Set(['us-east-1', 'eu-central-1', 'us-gov-west-1', 'us-gov-east-1']);
+
+// Read a value out of ~/.claude/settings.json without letting a malformed file
+// break startup.
+function claudeSetting(pathParts) {
+  try {
+    let node = JSON.parse(fs.readFileSync(paths.claudeSettingsFile(), 'utf8'));
+    for (const part of pathParts) {
+      if (!node || typeof node !== 'object') return null;
+      node = node[part];
+    }
+    return typeof node === 'string' ? node : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+// Kiro records the region it is signed in to in its profile ARN, e.g.
+// arn:aws:codewhisperer:us-east-1:...:profile/ABC. That — not AWS_REGION — is
+// the region whose krsEndpoints override Kiro will honour.
+function detectKiroRegion() {
+  try {
+    const profile = JSON.parse(fs.readFileSync(paths.kiroProfileFile(), 'utf8'));
+    const m = /^arn:[^:]*:codewhisperer:([a-z0-9-]+):/.exec(String(profile.arn || ''));
+    if (m && KRS_REGIONS.has(m[1])) return m[1];
+  } catch (_) {}
+  return 'us-east-1';
+}
+
+// Bedrock's region: explicit override, then the process environment, then the
+// region Claude Code itself uses (~/.claude/settings.json env.AWS_REGION) —
+// which is what a wrapper-launched Bedrock setup actually talks to — then
+// us-east-1.
+function bedrockRegion() {
+  return (
+    process.env.HOLDFAST_BEDROCK_REGION ||
+    process.env.AWS_REGION ||
+    claudeSetting(['env', 'AWS_REGION']) ||
+    'us-east-1'
+  );
+}
 
 // --- Listeners -------------------------------------------------------------
 // Each listener is one local port mapped to one upstream API. A single
@@ -51,10 +99,13 @@ function parseListeners() {
   // (us-east-1) for any unsupported region, so we do NOT read AWS_REGION here
   // (that's Bedrock's region and is often unsupported by KRS, which would
   // forward to a non-existent runtime.<region>.kiro.dev host).
-  const KRS_REGIONS = new Set(['us-east-1', 'eu-central-1', 'us-gov-west-1']);
+  //
+  // Kiro only honours a krsEndpoints override for the region it resolved from
+  // its profile ARN, so the listener's region MUST match that ARN or the
+  // override is silently ignored. We therefore detect it (see kiroRegion()).
   const krsRequested =
     process.env.HOLDFAST_KIRO_REGION || process.env.HOLDFAST_CODEWHISPERER_REGION;
-  const krsRegion = KRS_REGIONS.has(krsRequested) ? krsRequested : 'us-east-1';
+  const krsRegion = KRS_REGIONS.has(krsRequested) ? krsRequested : detectKiroRegion();
 
   const listeners = [
     {
@@ -72,10 +123,18 @@ function parseListeners() {
       port: intEnv('HOLDFAST_BEDROCK_PORT', 8789),
       upstream:
         process.env.HOLDFAST_BEDROCK_UPSTREAM ||
-        `https://bedrock-runtime.${process.env.HOLDFAST_BEDROCK_REGION || process.env.AWS_REGION || 'us-east-1'}.amazonaws.com`,
+        `https://bedrock-runtime.${bedrockRegion()}.amazonaws.com`,
       // AWS endpoints need SigV4: Holdfast re-signs each attempt with this
-      // machine's own AWS credentials (env or ~/.aws/credentials).
+      // machine's own AWS credentials (credential chain in credentials.js).
       aws: true,
+      // The service to sign as. Stated rather than inferred, so a custom
+      // upstream (VPC endpoint, corporate proxy) still signs correctly.
+      service: 'bedrock',
+      // Accepts a /region/<r> path prefix so ONE listener can serve whichever
+      // region the client is actually configured for (Claude Code's region is
+      // its own setting, not Holdfast's) — see forward.js.
+      regionPrefix: true,
+      region: bedrockRegion(),
     },
     {
       // Kiro's chat streams through the Kiro Runtime Service (KRS). The agent
@@ -101,6 +160,10 @@ function parseListeners() {
         `https://runtime.${krsRegion}.kiro.dev`,
       // Bearer-token auth, not SigV4 — pass Authorization through untouched.
       aws: false,
+      // Marks this listener for the KRS request-shape filter: a stray local
+      // tool that happens to use this port must not be proxied to Kiro.
+      kiro: true,
+      region: krsRegion,
     },
   ];
 
@@ -129,9 +192,18 @@ const config = {
   upstreamTimeoutMs: intEnv('HOLDFAST_UPSTREAM_TIMEOUT_MS', 600_000),
 
   logFile:
-    process.env.HOLDFAST_LOG_FILE ||
-    path.join(os.homedir(), '.holdfast', 'holdfast.log'),
+    process.env.HOLDFAST_LOG_FILE || path.join(paths.holdfastHome(), 'holdfast.log'),
   logConsole: process.env.HOLDFAST_LOG_CONSOLE !== '0',
+
+  // Reject requests on the Kiro listener that are not KRS-shaped (a local dev
+  // server sharing the port would otherwise be forwarded to kiro.dev). Set
+  // HOLDFAST_KIRO_FILTER=0 to forward everything, as before.
+  kiroFilter: process.env.HOLDFAST_KIRO_FILTER !== '0',
+
+  krsRegions: KRS_REGIONS,
+  bedrockRegion: bedrockRegion(),
+  detectKiroRegion,
+  claudeSetting,
 };
 
 module.exports = config;
